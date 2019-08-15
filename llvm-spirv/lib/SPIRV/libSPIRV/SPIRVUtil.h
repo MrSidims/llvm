@@ -325,22 +325,30 @@ inline unsigned getSizeInWords(const std::string &Str) {
 }
 
 inline std::string getString(std::vector<uint32_t>::const_iterator Begin,
-                             std::vector<uint32_t>::const_iterator End) {
+                             std::vector<uint32_t>::const_iterator End,
+                             bool IsMultiLiteral = false) {
   std::string Str = std::string();
   for (auto I = Begin; I != End; ++I) {
     uint32_t Word = *I;
     for (unsigned J = 0u; J < 32u; J += 8u) {
       char Char = (char)((Word >> J) & 0xff);
-      if (Char == '\0')
-        return Str;
+      if (Char == '\0') {
+        if (!IsMultiLiteral)
+          return Str;
+        // If vector of Literals is expected to contain more than one Literal
+        if (I != End - 1)
+          Str += std::string(":");
+        break;
+      }
       Str += Char;
     }
   }
   return Str;
 }
 
-inline std::string getString(const std::vector<uint32_t> &V) {
-  return getString(V.cbegin(), V.cend());
+inline std::string getString(const std::vector<uint32_t> &V,
+                             bool IsMultiLiteral = false) {
+  return getString(V.cbegin(), V.cend(), IsMultiLiteral);
 }
 
 inline std::vector<uint32_t> getVec(const std::string &Str) {

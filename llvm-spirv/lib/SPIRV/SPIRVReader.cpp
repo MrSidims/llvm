@@ -2468,8 +2468,8 @@ void generateIntelFPGAAnnotation(const SPIRVEntry *E,
   if (E->hasDecorate(DecorationSimpleDualPortINTEL))
     Out << "{simple_dual_port:1}";
   if (E->hasDecorate(DecorationMergeINTEL))
-    Out << "{merge:" << E->getDecorationStringLiteral(DecorationMergeINTEL)
-        << '}';
+    Out << "{merge:" << E->getDecorationStringLiteral(
+        DecorationMergeINTEL, /*IsMultiLiteral*/ true) << '}';
   if (E->hasDecorate(DecorationUserSemantic))
     Out << E->getDecorationStringLiteral(DecorationUserSemantic);
 }
@@ -2504,10 +2504,8 @@ void generateIntelFPGAAnnotationForStructMember(
   if (E->hasMemberDecorate(DecorationSimpleDualPortINTEL, 0, MemberNumber))
     Out << "{simple_dual_port:1}";
   if (E->hasMemberDecorate(DecorationMergeINTEL, 0, MemberNumber))
-    Out << "{merge:"
-        << E->getMemberDecorationStringLiteral(DecorationMergeINTEL,
-                                               MemberNumber)
-        << '}';
+    Out << "{merge:" << E->getMemberDecorationStringLiteral(
+        DecorationMergeINTEL, MemberNumber, /*IsMultiLiteral*/ true) << '}';
   if (E->hasMemberDecorate(DecorationUserSemantic, 0, MemberNumber))
     Out << E->getMemberDecorationStringLiteral(DecorationUserSemantic,
                                                MemberNumber);
