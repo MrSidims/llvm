@@ -96,17 +96,8 @@ void bar() {
     f32x32x1();
   });
 
-  // Support for reqd_work_group_size (and other SYCL attributes) that apply to
-  // lambda expressions is not implemented in clang yet.
-  // When it lands, the following code is expected to compile successfully.
-  //
-  // expected-error@+1 {{'reqd_work_group_size' attribute cannot be applied to types}}
-  kernel<class kernel_name9>([]() [[cl::reqd_work_group_size(32, 32, 32)]] {
-    f32x32x32();
-  });
-  // While this case is not going to work (wrong syntax):
   // expected-error@+1 {{expected variable name or 'this' in lambda capture list}}
-  kernel<class kernel_name10>([[cl::reqd_work_group_size(32, 32, 32)]] []() {
+  kernel<class kernel_name9>([[cl::reqd_work_group_size(32, 32, 32)]] []() {
     f32x32x32();
   });
 
