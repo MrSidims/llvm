@@ -137,6 +137,10 @@ public:
 
   FPContractMode getFPContractMode() const { return FPCMode; }
 
+  void enableUsmAddrspaces() { EnableUsmAddrspaces = true; }
+
+  bool isUsmAddrspacesEnabled() { return EnableUsmAddrspaces; }
+
 private:
   // Common translation options
   VersionNumber MaxVersion = VersionNumber::MaximumVersion;
@@ -159,6 +163,13 @@ private:
   // - FPContractMode::Fast allows *all* operations to be contracted
   //   for all entry points
   FPContractMode FPCMode = FPContractMode::On;
+  // Controls translation of USM storage classes to USM address spaces.
+  //
+  // - true allows to use USM storage/addrspace
+  //
+  // - false prohibit translation of USM storage classess to USM addrspaces.
+  //   Instead, USM storage is translated to common global addrspace.
+  bool EnableUsmAddrspaces = false;
 };
 
 } // namespace SPIRV

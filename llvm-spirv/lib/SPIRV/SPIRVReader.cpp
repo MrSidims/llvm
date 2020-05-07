@@ -385,11 +385,18 @@ Type *SPIRVToLLVM::transType(SPIRVType *T, bool IsClassMember) {
   case OpTypeArray:
     return mapType(T, ArrayType::get(transType(T->getArrayElementType()),
                                      T->getArrayLength()));
-  case OpTypePointer:
+  case OpTypePointer: {
+    SPIRAddressSpace AS =
+      SPIRSPIRVAddrSpaceMap::rmap(T->getPointerStorageClass());
+    // If generation of SYCL USM address spaces isn't allowed in the reversed
+    // translation - transform them into global address space
+    if (!BM->isUsmAddrspacesEnabled() && (AS == SPIRAS_GlobalDevice ||
+                                          AS == SPIRAS_GlobalHost))
+      AS = SPIRAS_Global;
     return mapType(
         T, PointerType::get(
-               transType(T->getPointerElementType(), IsClassMember),
-               SPIRSPIRVAddrSpaceMap::rmap(T->getPointerStorageClass())));
+               transType(T->getPointerElementType(), IsClassMember), AS));
+  }
   case OpTypeVector:
     return mapType(T, VectorType::get(transType(T->getVectorComponentType()),
                                       T->getVectorComponentCount()));
@@ -931,8 +938,19 @@ Value *SPIRVToLLVM::transConvertInst(SPIRVValue *BV, Function *F,
   switch (BC->getOpCode()) {
   case OpPtrCastToGeneric:
   case OpGenericCastToPtr:
+  case OpPtrCastToGenericINTEL:
+  case OpGenericCastToPtrINTEL: {
+    // If module has pointers with DeviceOnlyINTEL and HostOnlyINTEL storage
+    // classes and if during reversed translation 'enable-usm-addrspaces'
+    // wasn't passed there will be a situation, when global_device/global_host
+    // address space will be lowered to just global address space. If there also
+    // is an addrspacecast - we need to replace it with source pointer.
+    if (Src->getType()->getPointerAddressSpace() ==
+        Dst->getPointerAddressSpace())
+      return Src;
     CO = Instruction::AddrSpaceCast;
     break;
+  }
   case OpSConvert:
     CO = IsExt ? Instruction::SExt : Instruction::Trunc;
     break;
@@ -3359,15 +3377,20 @@ bool SPIRVToLLVM::transOCLMetadata(SPIRVFunction *BF) {
   if (F->getCallingConv() != CallingConv::SPIR_KERNEL)
     return true;
 
-  // Generate metadata for kernel_arg_address_spaces
+  // Generate metadata for kernel_arg_addr_space
   addOCLKernelArgumentMetadata(
       Context, SPIR_MD_KERNEL_ARG_ADDR_SPACE, BF, F,
       [=](SPIRVFunctionParameter *Arg) {
         SPIRVType *ArgTy = Arg->getType();
         SPIRAddressSpace AS = SPIRAS_Private;
-        if (ArgTy->isTypePointer())
+        if (ArgTy->isTypePointer()) {
           AS = SPIRSPIRVAddrSpaceMap::rmap(ArgTy->getPointerStorageClass());
-        else if (ArgTy->isTypeOCLImage() || ArgTy->isTypePipe())
+          // If generation of SYCL USM address spaces isn't allowed in the reversed
+          // translation - transform them into global address space
+          if (!BM->isUsmAddrspacesEnabled() && (AS == SPIRAS_GlobalDevice ||
+                                                AS == SPIRAS_GlobalHost))
+            AS = SPIRAS_Global;
+        } else if (ArgTy->isTypeOCLImage() || ArgTy->isTypePipe())
           AS = SPIRAS_Global;
         return ConstantAsMetadata::get(
             ConstantInt::get(Type::getInt32Ty(*Context), AS));

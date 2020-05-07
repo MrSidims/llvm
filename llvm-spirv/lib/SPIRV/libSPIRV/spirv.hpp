@@ -196,6 +196,8 @@ enum StorageClass {
     StorageClassShaderRecordBufferNV = 5343,
     StorageClassPhysicalStorageBuffer = 5349,
     StorageClassPhysicalStorageBufferEXT = 5349,
+    StorageClassDeviceOnlyINTEL = 5936,
+    StorageClassHostOnlyINTEL = 5937,
     StorageClassMax = 0x7fffffff,
 };
 
@@ -953,6 +955,7 @@ enum Capability {
   CapabilityFPGARegINTEL = 5948,
   CapabilityKernelAttributesINTEL = 5892,
   CapabilityFPGAKernelAttributesINTEL = 5897,
+  CapabilityUSMStorageClassesINTEL = 5935,
   CapabilityIOPipeINTEL = 5943,
   CapabilityMax = 0x7fffffff,
 };
@@ -1496,6 +1499,8 @@ enum Op {
   OpReadPipeBlockingINTEL = 5946,
   OpWritePipeBlockingINTEL = 5947,
   OpFPGARegINTEL = 5949,
+  OpGenericCastToPtrINTEL = 9998,
+  OpPtrCastToGenericINTEL = 9999,
   OpMax = 0x7fffffff,
 };
 

@@ -174,6 +174,8 @@ inline bool isValid(spv::StorageClass V) {
   case StorageClassPushConstant:
   case StorageClassAtomicCounter:
   case StorageClassImage:
+  case StorageClassDeviceOnlyINTEL:
+  case StorageClassHostOnlyINTEL:
     return true;
   default:
     return false;
@@ -728,6 +730,8 @@ inline bool isValid(spv::Op V) {
   case OpConvertUToPtr:
   case OpPtrCastToGeneric:
   case OpGenericCastToPtr:
+  case OpPtrCastToGenericINTEL:
+  case OpGenericCastToPtrINTEL:
   case OpGenericCastToPtrExplicit:
   case OpBitcast:
   case OpSNegate:

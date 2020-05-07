@@ -178,6 +178,11 @@ static cl::opt<SPIRV::FPContractMode> FPCMode(
             SPIRV::FPContractMode::Fast, "fast",
             "allow all operations to be contracted for all entry points")));
 
+static cl::opt<bool>
+    EnableUsmAddrspaces("enable-usm-addrspaces", cl::init(false),
+                        cl::desc("Enable opencl_usm_device and opencl_usm_host "
+                                 "address spaces for reverse translation"));
+
 static std::string removeExt(const std::string &FileName) {
   size_t Pos = FileName.find_last_of(".");
   if (Pos != std::string::npos)
@@ -539,6 +544,14 @@ int main(int Ac, char **Av) {
                 "affects translation from SPIR-V to LLVM IR";
     } else {
       Opts.setDesiredBIsRepresentation(BIsRepresentation);
+    }
+  }
+  if (EnableUsmAddrspaces) {
+    if (!IsReverse) {
+      errs() << "Note: --enable-usm-addrspaces option ignored as it only "
+                "affects translation from SPIR-V to LLVM IR";
+    } else {
+      Opts.enableUsmAddrspaces();
     }
   }
 
