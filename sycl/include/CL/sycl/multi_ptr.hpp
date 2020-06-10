@@ -154,14 +154,15 @@ public:
   //    Space>
 
   // Only if Space == global_space || device_space and element type is const
-  template <
-      int dimensions, access::mode Mode, access::placeholder isPlaceholder,
-      access::address_space _Space = Space, typename ET = ElementType,
-      typename = typename std::enable_if<
-          _Space == Space && (Space == access::address_space::global_space ||
-                              Space == access::address_space::device_space) &&
-          std::is_const<ET>::value &&
-          std::is_same<ET, ElementType>::value>::type>
+  template <int dimensions, access::mode Mode,
+            access::placeholder isPlaceholder,
+            access::address_space _Space = Space, typename ET = ElementType,
+            typename = typename std::enable_if<
+                _Space == Space &&
+                (Space == access::address_space::global_space ||
+                 Space == access::address_space::device_space) &&
+                std::is_const<ET>::value &&
+                std::is_same<ET, ElementType>::value>::type>
   multi_ptr(accessor<typename std::remove_const<ET>::type, dimensions, Mode,
                      access::target::global_buffer, isPlaceholder>
                 Accessor)

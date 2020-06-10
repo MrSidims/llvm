@@ -155,13 +155,11 @@ struct remove_AS<__OPENCL_GLOBAL_AS__ T> {
   typedef T type;
 };
 
-template <class T>
-struct remove_AS<__OPENCL_GLOBAL_DEVICE_AS__ T> {
+template <class T> struct remove_AS<__OPENCL_GLOBAL_DEVICE_AS__ T> {
   typedef T type;
 };
 
-template <class T>
-struct remove_AS<__OPENCL_GLOBAL_HOST_AS__ T> {
+template <class T> struct remove_AS<__OPENCL_GLOBAL_HOST_AS__ T> {
   typedef T type;
 };
 
