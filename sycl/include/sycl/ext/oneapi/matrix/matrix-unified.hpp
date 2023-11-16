@@ -96,12 +96,10 @@ joint_matrix_apply(Group sg, joint_matrix<Group, T, Use, M, N, Layout> &jm,
   using storage_element_type =
       typename oneapi::detail::jm_type_interpretation_helper_trait<
           T>::storage_element_type;
-  auto wi_data_c = sycl::ext::oneapi::detail::get_wi_data(sg, jm);
-  for (int i = 0; i < wi_data_c.length(); i++) {
-    storage_element_type element = wi_data_c[i];
-    lambda(element);
-    wi_data_c[i] = element;
-  }
+  jm.spvm = __spirv_CooperativeMatrixApplyFunctionINTEL<
+    storage_element_type, T, M, N, spv_matrix_use_traits<Use>::value,
+    spv_matrix_layout_traits<Layout>::value>(
+        sycl::ext::oneapi::experimental::matrix::helper::ref(lambda), jm.spvm);
 #endif
 #else
   std::ignore = sg;

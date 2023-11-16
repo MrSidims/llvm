@@ -29,6 +29,26 @@ class tf32 {
 };
 } // namespace precision
 
+// TODO to move elsewhere if productized
+namespace helper {
+template <typename T>
+struct reference_wrapper {
+  reference_wrapper(T& val) : ref(&val) {}
+  operator T&() const {
+    return *ref;
+  }
+
+  private:
+    T *ref;
+};
+
+template <typename T>
+reference_wrapper<T> ref(T& val) {
+  return reference_wrapper<T>(val);
+}
+} // namespace helper
+
+
 } // namespace matrix
 } // namespace experimental
 } // namespace oneapi
@@ -61,6 +81,7 @@ convertMatrixUseStringToEnum(const char *UseString) {
   }
   return std::nullopt;
 }
+
 } // namespace detail
 } // namespace _V1
 } // namespace sycl

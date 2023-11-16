@@ -540,13 +540,11 @@ inline __SYCL_ALWAYS_INLINE void joint_matrix_apply(
   using storage_element_type =
       typename oneapi::detail::jm_type_interpretation_helper_trait<
           T>::storage_element_type;
-  auto wi_data_c = sycl::ext::oneapi::detail::get_wi_data(sg, jm);
-  for (int i = 0; i < wi_data_c.length(); i++) {
-    storage_element_type element = wi_data_c[i];
-    auto [row, col] = wi_data_c[i].get_coord();
-    lambda(element, row, col);
-    wi_data_c[i] = element;
-  }
+  jm.spvm = __spirv_CooperativeMatrixApplyFunctionINTEL<
+      storage_element_type, T, Rows, Cols,
+      sycl::ext::oneapi::experimental::matrix::spv_matrix_use_traits<Use>::value,
+      sycl::ext::oneapi::experimental::matrix::spv_matrix_layout_traits<Layout>::value>(
+          sycl::ext::oneapi::experimental::matrix::helper::ref(lambda), jm.spvm);
 #endif
 #else
   std::ignore = sg;

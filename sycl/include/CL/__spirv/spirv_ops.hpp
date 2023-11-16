@@ -139,6 +139,13 @@ extern __DPCPP_SYCL_EXTERNAL __spv::__spirv_JointMatrixINTEL<T, R, C, L, S, U> *
 __spirv_VectorInsertDynamic(__spv::__spirv_JointMatrixINTEL<T, R, C, L, S, U> *,
                             Ts val, size_t i);
 
+template <typename Ts, typename T, std::size_t R, std::size_t C,
+          __spv::MatrixUse U, __spv::MatrixLayout L, __spv::Scope::Flag S,
+          typename F>
+extern __DPCPP_SYCL_EXTERNAL __spv::__spirv_JointMatrixINTEL<T, R, C, L, S, U> *
+__spirv_CooperativeMatrixApplyFunctionINTEL(
+    F &&, __spv::__spirv_JointMatrixINTEL<T, R, C, L, S, U> *);
+
 #ifndef __SPIRV_BUILTIN_DECLARATIONS__
 #error                                                                         \
     "SPIR-V built-ins are not available. Please set -fdeclare-spirv-builtins flag."
