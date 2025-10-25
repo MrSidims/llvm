@@ -33,6 +33,7 @@
 #include "llvm/SYCLLowerIR/ESIMD/ESIMDUtils.h"
 #include "llvm/SYCLLowerIR/HostPipes.h"
 #include "llvm/SYCLLowerIR/LowerInvokeSimd.h"
+#include "llvm/SYCLLowerIR/OutlineDebugInfo.h"
 #include "llvm/SYCLLowerIR/SYCLJointMatrixTransform.h"
 #include "llvm/SYCLLowerIR/SYCLUtils.h"
 #include "llvm/SYCLLowerIR/SpecConstants.h"
@@ -51,10 +52,19 @@
 #include "llvm/Transforms/IPO/StripDeadPrototypes.h"
 
 #include <algorithm>
+#include <atomic>
+#include <condition_variable>
+#include <map>
 #include <memory>
+#include <mutex>
+#include <queue>
 #include <string>
 #include <utility>
 #include <vector>
+
+// Include ThreadPool support
+#include "llvm/Support/ThreadPool.h"
+#include "llvm/Support/Threading.h"
 
 using namespace llvm;
 using namespace llvm::sycl;
@@ -254,6 +264,25 @@ cl::opt<bool> AllowDeviceImageDependencies{
     "allow-device-image-dependencies",
     cl::desc("Allow dependencies between device images"), cl::cat(PostLinkCat),
     cl::init(false)};
+
+cl::opt<bool> OutlineDebugInfo{
+    "outline-debug-info",
+    cl::desc("Outline debug information into a separate module"),
+    cl::cat(PostLinkCat), cl::init(false)};
+
+cl::opt<unsigned> ParallelSplitProcessing{
+    "parallel-split",
+    cl::desc("Enable parallel processing of split modules. "
+             "Specify maximum number of modules to process concurrently "
+             "(0 = use hardware concurrency, default)"),
+    cl::init(0), cl::cat(PostLinkCat)};
+
+cl::opt<unsigned> MaxModulesInMemory{
+    "max-modules-in-memory",
+    cl::desc("Maximum number of split modules to keep in memory simultaneously "
+             "(default: 8). Lower values reduce memory usage but may reduce "
+             "parallelism."),
+    cl::init(8), cl::cat(PostLinkCat)};
 
 struct IrPropSymFilenameTriple {
   std::string Ir;
@@ -542,6 +571,129 @@ bool isTargetCompatibleWithModule(const std::string &Target,
   return true;
 }
 
+// ======== Parallel Processing Infrastructure ========
+
+/// Thread-safe bounded queue for producer-consumer pattern.
+/// Limits memory usage by bounding the number of processed modules in memory.
+template <typename T>
+class BoundedQueue {
+  std::queue<T> Queue;
+  mutable std::mutex Mutex;  // mutable for const methods
+  std::condition_variable NotEmpty;
+  std::condition_variable NotFull;
+  size_t MaxSize;
+  bool Closed = false;
+
+public:
+  explicit BoundedQueue(size_t MaxSize) : MaxSize(MaxSize) {}
+
+  void push(T Item) {
+    std::unique_lock<std::mutex> Lock(Mutex);
+    NotFull.wait(Lock, [this] { return Queue.size() < MaxSize || Closed; });
+    if (Closed)
+      return;
+    Queue.push(std::move(Item));
+    NotEmpty.notify_one();
+  }
+
+  bool pop(T &Item) {
+    std::unique_lock<std::mutex> Lock(Mutex);
+    NotEmpty.wait(Lock, [this] { return !Queue.empty() || Closed; });
+    if (Queue.empty())
+      return false;
+    Item = std::move(Queue.front());
+    Queue.pop();
+    NotFull.notify_one();
+    return true;
+  }
+
+  void close() {
+    std::unique_lock<std::mutex> Lock(Mutex);
+    Closed = true;
+    NotEmpty.notify_all();
+    NotFull.notify_all();
+  }
+
+  size_t size() const {
+    std::unique_lock<std::mutex> Lock(Mutex);
+    return Queue.size();
+  }
+};
+
+/// Represents a processed module with all its split results.
+struct ProcessedModule {
+  SmallVector<module_split::ModuleDesc, 2> Modules;
+  SmallVector<module_split::ModuleDesc, 2> ModulesWithDefaultSpecConsts;
+  int ID;
+  bool IsBF16DeviceLibUsed = false;
+  std::string Error;  // Empty if successful
+
+  ProcessedModule() : ID(0), IsBF16DeviceLibUsed(false) {}
+  ProcessedModule(int Id) : ID(Id), IsBF16DeviceLibUsed(false) {}
+};
+
+/// Represents a work item to be processed by a worker thread.
+struct WorkItem {
+  module_split::ModuleDesc MDesc;
+  int ID = 0;
+
+  WorkItem() : MDesc(nullptr), ID(0) {}
+  WorkItem(module_split::ModuleDesc &&M, int Id)
+      : MDesc(std::move(M)), ID(Id) {}
+};
+
+/// Worker function that processes a single split module.
+/// This function is thread-safe and can be called concurrently.
+ProcessedModule processSingleSplit(WorkItem Item, bool &Modified,
+                                    bool &SplitOccurred) {
+  ProcessedModule Result(Item.ID);
+  module_split::ModuleDesc &MDesc = Item.MDesc;
+
+  DUMP_ENTRY_POINTS(MDesc.entries(), MDesc.Name.c_str(), 1);
+
+  MDesc.fixupLinkageOfDirectInvokeSimdTargets();
+
+  ESIMDProcessingOptions Options = {SplitMode,
+                                    EmitOnlyKernelsAsEntryPoints,
+                                    AllowDeviceImageDependencies,
+                                    LowerEsimd,
+                                    SplitEsimd,
+                                    getOptLevel(),
+                                    ForceDisableESIMDOpt};
+
+  auto ModulesOrErr =
+      handleESIMD(std::move(MDesc), Options, Modified, SplitOccurred);
+
+  if (!ModulesOrErr) {
+    Result.Error = toString(ModulesOrErr.takeError());
+    return Result;
+  }
+
+  Result.Modules = std::move(*ModulesOrErr);
+
+  // Process specialization constants for each module
+  for (size_t I = 0; I != Result.Modules.size(); ++I) {
+    if (GenerateDeviceImageWithDefaultSpecConsts) {
+      std::optional<module_split::ModuleDesc> NewMD =
+          processSpecConstantsWithDefaultValues(Result.Modules[I]);
+      if (NewMD)
+        Result.ModulesWithDefaultSpecConsts.push_back(std::move(*NewMD));
+    }
+
+    Modified |= processSpecConstants(Result.Modules[I]);
+  }
+
+  // Check for BF16 device library usage
+  for (module_split::ModuleDesc &IrMD : Result.Modules) {
+    Result.IsBF16DeviceLibUsed |= isSYCLDeviceLibBF16Used(IrMD.getModule());
+  }
+  for (module_split::ModuleDesc &IrMD : Result.ModulesWithDefaultSpecConsts) {
+    Result.IsBF16DeviceLibUsed |= isSYCLDeviceLibBF16Used(IrMD.getModule());
+  }
+
+  return Result;
+}
+
 std::vector<std::unique_ptr<util::SimpleTable>>
 processInputModule(std::unique_ptr<Module> M, const StringRef OutputPrefix) {
   // Construct the resulting table which will accumulate all the outputs.
@@ -575,6 +727,18 @@ processInputModule(std::unique_ptr<Module> M, const StringRef OutputPrefix) {
   // if none were made.
   bool Modified = llvm::module_split::runPreSplitProcessingPipeline(*M);
 
+  // Outline debug info if requested, before module splitting
+  if (OutlineDebugInfo) {
+    ModulePassManager MPM;
+    ModuleAnalysisManager MAM;
+    PassBuilder PB;
+    PB.registerModuleAnalyses(MAM);
+
+    MPM.addPass(OutlineDebugInfoPass(OutputPrefix));
+    PreservedAnalyses PA = MPM.run(*M, MAM);
+    Modified |= !PA.areAllPreserved();
+  }
+
   // Keeps track of whether any device image uses bf16 devicelib.
   bool IsBF16DeviceLibUsed = false;
 
@@ -602,73 +766,229 @@ processInputModule(std::unique_ptr<Module> M, const StringRef OutputPrefix) {
       error(toString(std::move(E)));
   }
 
-  // It is important that we *DO NOT* preserve all the splits in memory at the
-  // same time, because it leads to a huge RAM consumption by the tool on bigger
-  // inputs.
-  while (Splitter->hasMoreSplits()) {
-    module_split::ModuleDesc MDesc = Splitter->nextSplit();
-    DUMP_ENTRY_POINTS(MDesc.entries(), MDesc.Name.c_str(), 1);
+  // Determine if we should use parallel processing.
+  // Parallel processing is enabled when:
+  // 1. User explicitly requests it via --parallel-split, OR
+  // 2. Environment variable SYCL_POST_LINK_PARALLEL is set, OR
+  // 3. There are multiple splits (> 1) that would benefit from parallelism
+  bool UseParallel = false;
+  unsigned NumWorkers = 0;
 
-    MDesc.fixupLinkageOfDirectInvokeSimdTargets();
+  if (ParallelSplitProcessing.getNumOccurrences() > 0 &&
+      ParallelSplitProcessing > 0) {
+    UseParallel = true;
+    NumWorkers = ParallelSplitProcessing;
+  } else if (const char *EnvVar = std::getenv("SYCL_POST_LINK_PARALLEL")) {
+    // Check environment variable
+    if (std::string(EnvVar) == "1" || std::string(EnvVar) == "true") {
+      UseParallel = true;
+      NumWorkers = llvm::hardware_concurrency().compute_thread_count();
+    }
+  }
 
-    ESIMDProcessingOptions Options = {SplitMode,
-                                      EmitOnlyKernelsAsEntryPoints,
-                                      AllowDeviceImageDependencies,
-                                      LowerEsimd,
-                                      SplitEsimd,
-                                      getOptLevel(),
-                                      ForceDisableESIMDOpt};
-    auto ModulesOrErr =
-        handleESIMD(std::move(MDesc), Options, Modified, SplitOccurred);
-    CHECK_AND_EXIT(ModulesOrErr.takeError());
-    SmallVector<module_split::ModuleDesc, 2> &MMs = *ModulesOrErr;
-    assert(MMs.size() && "at least one module is expected after ESIMD split");
-    SmallVector<module_split::ModuleDesc, 2> MMsWithDefaultSpecConsts;
-    for (size_t I = 0; I != MMs.size(); ++I) {
-      if (GenerateDeviceImageWithDefaultSpecConsts) {
-        std::optional<module_split::ModuleDesc> NewMD =
-            processSpecConstantsWithDefaultValues(MMs[I]);
-        if (NewMD)
-          MMsWithDefaultSpecConsts.push_back(std::move(*NewMD));
+  // Don't use parallel processing for single modules or IR-only output
+  if (Splitter->remainingSplits() <= 1 || IROutputOnly) {
+    UseParallel = false;
+  }
+
+  // ========== PARALLEL PROCESSING PATH ==========
+  if (UseParallel) {
+    llvm::ThreadPoolStrategy Strategy = llvm::hardware_concurrency(NumWorkers);
+    DefaultThreadPool Pool{Strategy};
+
+    // Bounded queues for producer-consumer pattern
+    BoundedQueue<WorkItem> WorkQueue(MaxModulesInMemory);
+    BoundedQueue<ProcessedModule> ResultQueue(MaxModulesInMemory);
+
+    std::atomic<bool> ProducerDone{false};
+    std::atomic<bool> ErrorOccurred{false};
+    std::string FirstError;
+    std::mutex ErrorMutex;
+
+    // Producer thread: feeds work items from the splitter
+    auto ProducerTask = [&]() {
+      int WorkID = 0;
+      while (Splitter->hasMoreSplits() && !ErrorOccurred.load()) {
+        module_split::ModuleDesc MDesc = Splitter->nextSplit();
+        WorkQueue.push(WorkItem(std::move(MDesc), WorkID++));
+      }
+      WorkQueue.close();
+      ProducerDone.store(true);
+    };
+
+    // Worker threads: process modules in parallel
+    std::atomic<unsigned> ActiveWorkers{0};
+    auto WorkerTask = [&]() {
+      ActiveWorkers.fetch_add(1);
+      WorkItem Item;
+      while (WorkQueue.pop(Item) && !ErrorOccurred.load()) {
+        ProcessedModule Result = processSingleSplit(std::move(Item), Modified,
+                                                      SplitOccurred);
+        if (!Result.Error.empty()) {
+          std::lock_guard<std::mutex> Lock(ErrorMutex);
+          if (!ErrorOccurred.load()) {
+            FirstError = Result.Error;
+            ErrorOccurred.store(true);
+          }
+          break;
+        }
+        ResultQueue.push(std::move(Result));
+      }
+      // Last worker to finish closes the result queue
+      if (ActiveWorkers.fetch_sub(1) == 1) {
+        ResultQueue.close();
+      }
+    };
+
+    // Consumer thread: saves modules to disk (must be single-threaded due to ID assignment)
+    auto ConsumerTask = [&]() {
+      // Map to reorder results by ID
+      std::map<int, ProcessedModule> PendingResults;
+      int NextExpectedID = 0;
+      int CurrentOutputID = ID;  // Local counter for output IDs
+
+      auto ProcessResult = [&](ProcessedModule &Result) {
+        std::string OutIRFileName = "";
+        if (!Modified && (OutputFiles.getNumOccurrences() == 0)) {
+          assert(!SplitOccurred);
+          OutIRFileName = InputFilename;
+          errs() << "sycl-post-link NOTE: no modifications to the input LLVM IR "
+                    "have been made\n";
+        }
+
+        for (module_split::ModuleDesc &IrMD : Result.Modules) {
+          IsBF16DeviceLibUsed |= Result.IsBF16DeviceLibUsed;
+          saveModule(Tables, IrMD, CurrentOutputID, OutputPrefix, OutIRFileName);
+        }
+
+        ++CurrentOutputID;
+
+        if (!Result.ModulesWithDefaultSpecConsts.empty()) {
+          for (module_split::ModuleDesc &IrMD : Result.ModulesWithDefaultSpecConsts) {
+            IsBF16DeviceLibUsed |= Result.IsBF16DeviceLibUsed;
+            saveModule(Tables, IrMD, CurrentOutputID, OutputPrefix, OutIRFileName);
+          }
+          ++CurrentOutputID;
+        }
+      };
+
+      ProcessedModule Result;
+      while (ResultQueue.pop(Result) && !ErrorOccurred.load()) {
+        // Store result and process in order
+        PendingResults[Result.ID] = std::move(Result);
+
+        // Process all consecutive results starting from NextExpectedID
+        while (PendingResults.count(NextExpectedID)) {
+          ProcessResult(PendingResults[NextExpectedID]);
+          PendingResults.erase(NextExpectedID);
+          ++NextExpectedID;
+        }
       }
 
-      Modified |= processSpecConstants(MMs[I]);
-    }
-
-    if (IROutputOnly) {
-      if (SplitOccurred) {
-        error("some modules had to be split, '-" + IROutputOnly.ArgStr +
-              "' can't be used");
+      // Process any remaining results
+      while (!PendingResults.empty() && !ErrorOccurred.load()) {
+        auto It = PendingResults.begin();
+        ProcessResult(It->second);
+        PendingResults.erase(It);
       }
-      MMs.front().cleanup(AllowDeviceImageDependencies);
-      saveModuleIR(MMs.front().getModule(), OutputFiles[0].Filename);
-      return Tables;
-    }
-    // Empty IR file name directs saveModule to generate one and save IR to
-    // it:
-    std::string OutIRFileName = "";
 
-    if (!Modified && (OutputFiles.getNumOccurrences() == 0)) {
-      assert(!SplitOccurred);
-      OutIRFileName = InputFilename; // ... non-empty means "skip IR writing"
-      errs() << "sycl-post-link NOTE: no modifications to the input LLVM IR "
-                "have been made\n";
-    }
-    for (module_split::ModuleDesc &IrMD : MMs) {
-      IsBF16DeviceLibUsed |= isSYCLDeviceLibBF16Used(IrMD.getModule());
-      saveModule(Tables, IrMD, ID, OutputPrefix, OutIRFileName);
+      // Update the outer ID variable for any subsequent processing
+      ID = CurrentOutputID;
+    };
+
+    // Start all threads
+    auto ProducerFuture = Pool.async(ProducerTask);
+    auto ConsumerFuture = Pool.async(ConsumerTask);
+
+    // Start worker threads
+    std::vector<std::shared_future<void>> WorkerFutures;
+    unsigned ActualWorkers = std::min(NumWorkers,
+                                      (unsigned)Splitter->remainingSplits());
+    for (unsigned i = 0; i < ActualWorkers; ++i) {
+      WorkerFutures.push_back(Pool.async(WorkerTask));
     }
 
-    ++ID;
+    // Wait for all threads to complete
+    ProducerFuture.wait();
+    for (auto &F : WorkerFutures)
+      F.wait();
+    ConsumerFuture.wait();
 
-    if (!MMsWithDefaultSpecConsts.empty()) {
-      for (size_t i = 0; i != MMsWithDefaultSpecConsts.size(); ++i) {
-        module_split::ModuleDesc &IrMD = MMsWithDefaultSpecConsts[i];
+    // Check for errors
+    if (ErrorOccurred.load()) {
+      error(FirstError);
+    }
+
+  } else {
+    // ========== SEQUENTIAL PROCESSING PATH (original) ==========
+    // It is important that we *DO NOT* preserve all the splits in memory at the
+    // same time, because it leads to a huge RAM consumption by the tool on bigger
+    // inputs.
+    while (Splitter->hasMoreSplits()) {
+      module_split::ModuleDesc MDesc = Splitter->nextSplit();
+      DUMP_ENTRY_POINTS(MDesc.entries(), MDesc.Name.c_str(), 1);
+
+      MDesc.fixupLinkageOfDirectInvokeSimdTargets();
+
+      ESIMDProcessingOptions Options = {SplitMode,
+                                        EmitOnlyKernelsAsEntryPoints,
+                                        AllowDeviceImageDependencies,
+                                        LowerEsimd,
+                                        SplitEsimd,
+                                        getOptLevel(),
+                                        ForceDisableESIMDOpt};
+      auto ModulesOrErr =
+          handleESIMD(std::move(MDesc), Options, Modified, SplitOccurred);
+      CHECK_AND_EXIT(ModulesOrErr.takeError());
+      SmallVector<module_split::ModuleDesc, 2> &MMs = *ModulesOrErr;
+      assert(MMs.size() && "at least one module is expected after ESIMD split");
+      SmallVector<module_split::ModuleDesc, 2> MMsWithDefaultSpecConsts;
+      for (size_t I = 0; I != MMs.size(); ++I) {
+        if (GenerateDeviceImageWithDefaultSpecConsts) {
+          std::optional<module_split::ModuleDesc> NewMD =
+              processSpecConstantsWithDefaultValues(MMs[I]);
+          if (NewMD)
+            MMsWithDefaultSpecConsts.push_back(std::move(*NewMD));
+        }
+
+        Modified |= processSpecConstants(MMs[I]);
+      }
+
+      if (IROutputOnly) {
+        if (SplitOccurred) {
+          error("some modules had to be split, '-" + IROutputOnly.ArgStr +
+                "' can't be used");
+        }
+        MMs.front().cleanup(AllowDeviceImageDependencies);
+        saveModuleIR(MMs.front().getModule(), OutputFiles[0].Filename);
+        return Tables;
+      }
+      // Empty IR file name directs saveModule to generate one and save IR to
+      // it:
+      std::string OutIRFileName = "";
+
+      if (!Modified && (OutputFiles.getNumOccurrences() == 0)) {
+        assert(!SplitOccurred);
+        OutIRFileName = InputFilename; // ... non-empty means "skip IR writing"
+        errs() << "sycl-post-link NOTE: no modifications to the input LLVM IR "
+                  "have been made\n";
+      }
+      for (module_split::ModuleDesc &IrMD : MMs) {
         IsBF16DeviceLibUsed |= isSYCLDeviceLibBF16Used(IrMD.getModule());
         saveModule(Tables, IrMD, ID, OutputPrefix, OutIRFileName);
       }
 
       ++ID;
+
+      if (!MMsWithDefaultSpecConsts.empty()) {
+        for (size_t i = 0; i != MMsWithDefaultSpecConsts.size(); ++i) {
+          module_split::ModuleDesc &IrMD = MMsWithDefaultSpecConsts[i];
+          IsBF16DeviceLibUsed |= isSYCLDeviceLibBF16Used(IrMD.getModule());
+          saveModule(Tables, IrMD, ID, OutputPrefix, OutIRFileName);
+        }
+
+        ++ID;
+      }
     }
   }
 

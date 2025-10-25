@@ -63,6 +63,7 @@ add_llvm_component_library(LLVMSYCLLowerIR
   TargetHelpers.cpp
 
   SanitizerPostOptimizer.cpp
+  OutlineDebugInfo.cpp
 
   ADDITIONAL_HEADER_DIRS
   ${LLVM_MAIN_INCLUDE_DIR}/llvm/SYCLLowerIR
