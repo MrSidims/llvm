@@ -1143,19 +1143,28 @@ static void AddAliasScopeMetadata(CallBase &CB, ValueToValueMapTy &VMap,
   DenseMap<const Argument *, MDNode *> NewScopes;
   MDBuilder MDB(CalledFunc->getContext());
 
+  // For SYCL/SPIR/SPIR-V targets, disable function name encoding in alias
+  // metadata to reduce metadata bloat and improve compilation performance.
+  const Module *M = CalledFunc->getParent();
+  StringRef TripleStr = M->getTargetTriple().str();
+  bool IsSPIRTarget = TripleStr.contains("spir");
+
   // Create a new scope domain for this function.
-  MDNode *NewDomain =
-    MDB.createAnonymousAliasScopeDomain(CalledFunc->getName());
+  MDNode *NewDomain = MDB.createAnonymousAliasScopeDomain(
+      IsSPIRTarget ? StringRef() : CalledFunc->getName());
   for (unsigned i = 0, e = NoAliasArgs.size(); i != e; ++i) {
     const Argument *A = NoAliasArgs[i];
 
-    std::string Name = std::string(CalledFunc->getName());
-    if (A->hasName()) {
-      Name += ": %";
-      Name += A->getName();
-    } else {
-      Name += ": argument ";
-      Name += utostr(i);
+    std::string Name;
+    if (!IsSPIRTarget) {
+      Name = std::string(CalledFunc->getName());
+      if (A->hasName()) {
+        Name += ": %";
+        Name += A->getName();
+      } else {
+        Name += ": argument ";
+        Name += utostr(i);
+      }
     }
 
     // Note: We always create a new anonymous root here. This is true regardless
